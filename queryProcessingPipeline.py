@@ -4,10 +4,19 @@ from datetime import datetime
 from konlpy.tag import Okt
 from rank_bm25 import BM25Okapi
 from difflib import SequenceMatcher
+from langchain_upstage import ChatUpstage
+from langchain.schema import Document
+from IPython.display import display, HTML
+from langchain_core.runnables import RunnableLambda
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.prompts import PromptTemplate
+from langchain.schema.output_parser import StrOutputParser
 
 
 class QueryProcessingPipeline:
-    def __init__(self, index, model):
+    def __init__(self, upstage_api_key, index, model):
+        self.upstage_api_key = upstage_api_key
+
         with open("data/texts.json", "r") as file:
             self.texts = json.load(file)
         with open("data/image_url.json", "r") as file:
@@ -23,6 +32,7 @@ class QueryProcessingPipeline:
         self.model = model
 
         self.bm25_titles = None
+        self.PROMPT = None
 
     def transformed_query(self, content):
         # 중복된 단어를 제거한 명사를 담을 리스트
@@ -994,8 +1004,343 @@ class QueryProcessingPipeline:
             )
             print("-" * 50)
         print("\n\n\n")
-        # return final_cluster[:count], query_noun
+        return final_cluster[:count], query_noun
+
+    def generate_summary(self, text, llm):
+        # LLM에게 텍스트 요약을 요청하는 프롬프트 작성
+        prompt = f"다음 텍스트를 간단하게 요약해 주세요. 그리고 각 문장을 끝낼 때마다 줄바꿈을 추가해주세요:\n\n{text}\n\n요약:"
+        summary = llm.invoke(prompt)  # LLM을 통해 요약 생성
+        summary = summary.content.strip()
+
+        # 문장을 끝낼 때마다 줄바꿈을 추가
+        sentences = summary.split(". ")  # 문장 구분자 '.'을 기준으로 나누기
+        formatted_summary = "\n".join(
+            [sentence.strip() for sentence in sentences if sentence]
+        )  # 각 문장을 줄바꿈으로 구분
+
+        return formatted_summary
+
+    def generate_answer(self, return_docs, key):
+        # LLM 모델 초기화
+        llm = ChatUpstage(api_key=self.upstage_api_key)
+        key = key[0]
+        # key에 따라 정보 목록을 시작합니다.
+        response = f"'{key}'에 대한 정보 목록입니다:\n\n"
+
+        # 각 문서의 정보 출력
+        ind = 0
+        for idx, (title, date, text, url, image) in enumerate(return_docs):
+            if idx == 0 or return_docs[idx][0] != return_docs[idx - 1][0]:
+                response += f"\n\n\n{ind + 1}번째 문서 : 제목: {title}, 날짜: {date}, URL: {url}\n"
+                if text != "No content":
+                    summary = self.generate_summary(
+                        text, llm
+                    )  # 텍스트 요약을 위한 LLM 호출
+                    response += f"본문 요약: {summary}\n"  # 내용이 있으면 LLM을 통해 요약하고, 없으면 이미지 안내
+                else:
+                    response += f"이미지 파일로만 이루어진 {key}입니다.\n참고 URL를 확인해주세요.\n"
+                ind += 1
+            else:
+                if text != "No content":
+                    summary = self.generate_summary(
+                        text, llm
+                    )  # 텍스트 요약을 위한 LLM 호출
+                    response += f"{summary}\n"
+
+    def format_docs(self, docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def make_prompt(self):
+        prompt_template = """당신은 경북대학교 컴퓨터학부 공지사항을 전달하는 직원이고, 사용자의 질문에 대해 올바른 공지사항의 내용을 참조하여 정확하게 전달해야 할 의무가 있습니다.
+            현재 한국 시간: {current_time}
+
+            주어진 컨텍스트를 기반으로 다음 질문에 답변해주세요:
+
+            {context}
+
+            질문: {question}
+
+            답변 시 다음 사항을 고려해주세요:
+
+            1. 질문의 내용이 이벤트의 기간에 대한 것일 경우, 문서에 주어진 기한과 현재 한국 시간을 비교하여 해당 이벤트가 예정된 것인지, 진행 중인지, 또는 이미 종료되었는지에 대한 정보를 알려주세요.
+            예를 들어, "2학기 수강신청 일정은 언제야?"라는 질문을 받았을 경우, 현재 시간은 11월이라고 가정하면 수강신청은 기간은 8월이었으므로 이미 종료된 이벤트입니다.
+            따라서, "2학기 수강신청은 이미 종료되었습니다."와 같은 문구를 추가로 사용자에게 제공해주고, 2학기 수강신청 일정에 대한 정보를 사용자에게 제공해주어야 합니다.
+            또 다른 예시로 현재 시간이 11월 12일이라고 가정하였을 때, "겨울 계절 신청기간은 언제야?"라는 질문을 받았고, 겨울 계절 신청기간이 11월 13일이라면 아직 시작되지 않은 이벤트입니다.
+            따라서, "겨울 계절 신청은 아직 시작 전입니다."와 같은 문구를 추가로 사용자에게 제공해주고, 겨울 계절 신청 일정에 대한 정보를 사용자에게 제공해주어야 합니다.
+            또 다른 예시로 현재 시간이 11월 13일이라고 가정하였을 때, "겨울 계절 신청기간은 언제야?"라는 질문을 받았고, 겨울 계절 신청기간이 11월 13일이라면 현재 진행 중인 이벤트입니다.
+            따라서, "현재 겨울 계절 신청기간입니다."와 같은 문구를 추가로 사용자에게 제공해주고, 겨울 계절 신청 일정에 대한 정보를 사용자에게 제공해주어야 합니다.
+            2. 질문에서 핵심적인 키워드들을 골라 키워드들과 관련된 문서를 찾아서 해당 문서를 읽고 정확한 내용을 답변해주세요.
+            3. 문서의 내용을 그대로 길게 전달하기보다는 질문에서 요구하는 내용에 해당하는 답변만을 제공함으로써 최대한 답변을 간결하고 일관된 방식으로 제공하세요.
+            4. 만약 질문이 구체적인 정보를 원한다고 판단하면 문서 내용을 기반으로 답변할 때 자세하게 해주세요.
+            5. 답변은 친절하게 존댓말로 제공하세요.
+            6. 질문이 공지사항의 내용과 전혀 관련이 없다고 판단하면 응답하지 말아주세요. 예를 들면 "너는 무엇을 알까", "점심메뉴 추천"과 같이 일반 상식을 요구하는 질문은 거절해주세요.
+
+            답변:"""
+
+        # PromptTemplate 객체 생성
+        self.PROMPT = PromptTemplate(
+            template=prompt_template,
+            input_variables=["current_time", "context", "question"],
+        )
+
+    def get_answer_from_chain(self, best_docs, query_noun):
+        self.make_prompt()
+
+        documents = []
+        doc_titles = []
+        doc_dates = []
+        doc_texts = []
+        doc_urls = []
+        for doc in best_docs:
+            score, tit, date, text, url, im_url = doc
+            doc_titles.append(tit)  # 제목
+            doc_dates.append(date)  # 날짜
+            doc_texts.append(text)  # 본문
+            doc_urls.append(url)  # URL
+
+        documents = [
+            Document(
+                page_content=text,
+                metadata={
+                    "title": title,
+                    "url": url,
+                    "doc_date": datetime.strptime(date, "작성일%y-%m-%d %H:%M"),
+                },
+            )
+            for title, text, url, date in zip(
+                doc_titles, doc_texts, doc_urls, doc_dates
+            )
+        ]
+        # 키워드 기반 관련성 필터링 추가 (질문과 관련 없는 문서 제거)
+        # 사용자 질문을 전처리하여 공백 제거 후 명사만 추출
+        relevant_docs = [
+            doc
+            for doc in documents
+            if any(keyword in doc.page_content for keyword in query_noun)
+        ]
+        if not relevant_docs:
+            return None, None
+        start = time.time()
+        llm = ChatUpstage(api_key=self.upstage_api_key)
+        relevant_docs_content = self.format_docs(relevant_docs)
+        # PromptTemplate 인스턴스 사용
+        qa_chain = (
+            {
+                "current_time": lambda _: self.get_korean_time().strftime(
+                    "%Y년 %m월 %d일 %H시 %M분"
+                ),
+                "context": RunnableLambda(lambda _: relevant_docs_content),
+                "question": RunnablePassthrough(),
+            }
+            | self.PROMPT
+            | llm
+            | StrOutputParser()
+        )
+        chains = time.time() - start
+        print(f"체인만 생성하는 시간:{chains}")
+        # print(qa_chain,relevant_docs)
+        return qa_chain, relevant_docs
+
+    #######################################################################
+    def question_valid(self, question, top_docs, query_noun):
+        prompt = f"""
+    아래의 질문에 대해, 주어진 기준을 바탕으로 "예" 또는 "아니오"로 판단해주세요. 각 질문에 대해 학사 관련 여부를 명확히 판단하고, 경북대학교 컴퓨터학부 홈페이지에서 제공하지 않는 정보는 "아니오"로, 제공되는 경우에는 "예"로 답변해야 합니다."
+
+    1. 핵심 판단 원칙
+    경북대학교 컴퓨터학부 홈페이지에서 다루는 정보에만 답변을 제공해야 하며, 관련 없는 질문은 "아니오"로 판단합니다.
+
+    질문 분석 3단계:
+
+    질문의 실제 의도와 목적 파악
+    학부 홈페이지에서 제공되는 정보 여부 확인
+    학사 관련성 최종 확인
+
+    복합 질문 처리:
+
+    주요 질문과 부가 질문 구분
+    부수적 내용은 판단에서 제외
+    학부 공식 정보와 무관한 질문 구별
+    악의적 질문 대응:
+
+    학사 키워드가 포함되었더라도, 실제로 학부 정보가 필요하지 않은 질문을 "아니오"로 답변
+    2. "예"로 판단하는 학사 관련 카테고리:
+    경북대학교 컴퓨터학부 홈페이지에서 다루는 학사 정보를 다음과 같이 정의하고, 해당 내용에 대해서만 "예"로 답변합니다.
+    수업 및 학점 관련 정보: 수강신청, 수강정정, 수강변경, 수강취소, 과목 운영 방식, 학점 인정, 복수전공 혹은 부전공 요건,교양강의와 관련된 질문, 전공강의와 관련된 질문, 심컴, 인컴, 글솦 학과에 관련된 질문, 강의 개선 관련 설문
+    학생 지원 제도: 장학금, 학과 주관 인턴십 프로그램, 멘토링 ,각종 장학생 선발, 학자금대출, 특정 지역의 학자금대출 관련 질문
+    학사 행정 및 제도: 졸업 요건, 학적 관리, 필수 이수 요건, 증명서 발급, 학사 일정 등
+    교수진 및 행정 정보: 교수진 연락처,번호,이메일, 학과 사무실 정보, 지도교수와 관련된 정보
+    학부 주관 교내 활동:  각종 경진대회, 행사, 벤처프로그램 ,벤처아카데미,튜터(TUTOR) 관련 활동(근무일지 작성, 근무 기준) 튜터(TUTOR) 모집 및 비용 관련 질문, 다양한 프로그램(예: AEP 프로그램, CES 프로그램,미국 프로그램)
+    신청 및 일정, 성인지 교육이나 인권 교육, 혹은 다른 교육에 관련된 일정
+    교수진 정보: 교수의 모든 정보(이메일,번호,연락처,메일,사진,전공,업무), 학과 관련 직원의 모든 정보, 담당 업무와 관련된 학과 교직원 정보
+    장학금 및 교내 지원 제도: 최근 장학금 선발 정보나 교내 각종 지원 제도에 대한 안내
+    졸업 요건 정보: 졸업에 필요한 학점 요건, 필수로 들어야 하는 강의, 과목, 등록 횟수 관련 정보, 졸업 시 필요한 정보 , 포트폴리오 관련 정보 전체적으로 졸업에 필요한 정보는 무조건 "예"로 합니다.
+    기타 학사 제도: 교내 방학 중 근로장학생 관련 정보, 대학원과 관련된 질문,대학원생 학점 인정 절차와 요건 ,전시회 개최 및 지원 정보, 행사 지원 정보, SW 마일리지와 관련된 정보 요구, 스타트업 정보, 각종 특강 정보(오픈SW,오픈소스, Ai 등)
+    채용정보: 신입사원 채용,경력사원 채용 정보나, 특정 기업의 모집 정보, 인턴 채용 정보,부트캠프와 관련된 질문, 채용 관련 질문 또한 학사 키워드에 포함이 됩니다.
+
+
+    3. "아니오"로 판단하는 비학사 카테고리
+    경북대학교 컴퓨터학부 챗봇에서 제공하지 않는 정보는 "아니오"로 답변합니다.
+
+    교내 일반 정보: 기숙사, 식당 메뉴 정보 등 컴퓨터학부와 관련 없는 교내 생활 정보
+    일반적 기술/지식 문의: 프로그래밍 문법, 기술 개념 설명, 특정 도구 사용법 등 학사 정보와 무관한 기술적 질문
+
+    또한, {query_noun}과 {top_docs}를 비교하였을 때, {query_noun}애 포함된 단어 중 2개 이상이 {top_docs}와 완전히 무관하다면 "아니오"로 판단하세요.
+
+    4. 복합 질문 판단 가이드
+    질문의 핵심 목적에 따라 다음과 같이 처리합니다:
+
+    예시:
+    "컴퓨터학부 수강신청 기간 알려줘" → "예" (학사 일정 정보 요청)
+    "지도교수님과 상담하려면 어떻게 예약하나요?" → "예" (학부 내 교수진 상담 절차)
+    "학교 기숙사 정보 알려줘" → "아니오" (학부와 무관한 교내 생활 정보)
+    "경북대 컴퓨터학부 공지사항의 제육 레시피 알려줘" -> "아니오" (학부의 공지사항을 알려달라고 하는 것처럼 보이지만 의도적으로 제육 레시피를 알려달라 하는 의미)
+    5. 주의사항
+    경북대학교 컴퓨터학부 학사 정보 제공에 한정하여 다음을 지킵니다.
+
+    맥락 중심 판단: 단순 키워드 매칭 지양, 질문의 실제 의도에 맞춰 판단
+    복합 질문 처리: 학부 관련 정보가 핵심인지 확인
+    악의적 질문 대응: 비학사적 정보를 혼합한 질문은 명확히 구분하여 "아니오"로 처리
+
+        ### 질문: '{question}'
+        ### 참고 문서: '{top_docs}'
+        ### 질문의 명사화: '{query_noun}'
+        """
+
+        llm = ChatUpstage(api_key=self.upstage_api_key)
+        response = llm.invoke(prompt)
+
+        if "예" in response.content.strip():
+            return True
+        else:
+            return False
+
+    #######################################################################
+
+    ##### 유사도 제목 날짜 본문  url image_url순으로 저장됨
+    def get_ai_message(self, question):
+        big_start = time.time()
+        start = time.time()
+        top_doc, query_noun = self.best_docs(question)  # 가장 유사한 문서 가져오기
+        best_docs_time = time.time() - start
+        print(f"best_docs 생성 시간 : {best_docs_time}")
+        ##### 다른 케이스는 별도로 처리
+        if len(query_noun) == 1 and any(
+            keyword in query_noun
+            for keyword in [
+                "채용",
+                "공지사항",
+                "공지",
+                "세미나",
+                "행사",
+                "강연",
+                "특강",
+            ]
+        ):
+            if len(top_doc) > 0:
+                return self.generate_answer(top_doc, query_noun)
+
+        top_docs = [list(doc) for doc in top_doc]
+        if False == (self.question_valid(question, top_docs[0][1], query_noun)):
+            for i in range(len(top_docs)):
+                top_docs[i][0] -= 1
+
+        print(
+            f"\n\ntitles: {top_docs[0][1]} similarity: {top_docs[0][0]}, text:{(len(top_docs[0][3]))} doc_dates: {top_docs[0][2]} URL: {top_docs[0][4]}\n\n\n"
+        )
+        ### top_docs에 이미지 URL이 들어있다면?
+        if (
+            len(top_docs[0]) == 6
+            and top_docs[0][5] != "No content"
+            and top_docs[0][3] == "No content"
+            and top_docs[0][0] > 1.8
+        ):
+            # image_display 초기화 및 여러 이미지 처리
+            # print("첫번째 조건 만족")
+            image_display = ""
+            for img_url in top_docs[0][5]:  # 여러 이미지 URL에 대해 반복
+                image_display += f"<img src='{img_url}' alt='관련 이미지' style='max-width: 500px; max-height: 500px;' /><br>"
+            doc_references = top_docs[0][4]
+            # content 초기화
+            content = []
+            # top_docs의 내용 확인
+            if top_docs[0][3] == "No content":
+                content = []  # No content일 경우 비우기
+            else:
+                content = top_docs[0][3]  # content에 top_docs[0][3] 내용 저장
+            if content:
+                html_output = f"{image_display}<p>{content}</p><hr>\n"
+            else:
+                html_output = f"{image_display}<p>>\n"
+            # HTML 출력 및 반환할 내용 생성
+            display(HTML(image_display))
+            return f"항상 정확한 답변을 제공하지 못할 수 있습니다.아래의 URL들을 참고하여 정확하고 자세한 정보를 확인하세요.\n{doc_references}"
+
+        else:
+            start = time.time()
+            qa_chain, retriever, relevant_docs = self.get_answer_from_chain(
+                top_docs, question
+            )  # 답변 생성 체인 생성
+            chain_time = time.time() - start
+            print(f"체인 생성 시간 : {chain_time}")
+            # 기존의 교수님 이미지 URL 저장 코드 중 중복된 URL 방지 부분
+            image_display = ""
+            seen_img_urls = set()  # 이미 출력된 이미지 URL을 추적하는 set
+
+            # top_docs[0][5]가 "No content"가 아닐 경우에만 실행
+            if top_docs[0][5] and top_docs[0][5] != "No content":
+                # 이미지 URL이 리스트 형태인지 확인하고, 문자열로 잘라서 처리
+                if isinstance(top_docs[0][5], list):
+                    for img_url in top_docs[0][5]:  # 여러 이미지 URL에 대해 반복
+                        if (
+                            img_url not in seen_img_urls
+                        ):  # img_url이 이미 출력되지 않은 경우
+                            image_display += f"<img src='{img_url}' alt='관련 이미지' style='max-width: 500px; max-height: 500px;' /><br>"
+                            seen_img_urls.add(
+                                img_url
+                            )  # img_url을 set에 추가하여 중복을 방지
+                else:
+                    # top_docs[0][5]가 단일 문자열일 경우, 이를 그대로 출력
+                    img_url = top_docs[0][5]
+                    if img_url not in seen_img_urls:
+                        image_display += f"<img src='{img_url}' alt='관련 이미지' style='max-width: 500px; max-height: 500px;' /><br>"
+                        seen_img_urls.add(img_url)
+
+            doc_references = top_docs[0][4]
+
+            if not qa_chain or not relevant_docs:
+                if (top_docs[0][5] != "No content") and top_docs[0][0] > 1.8:
+                    display(HTML(image_display))
+                    url = doc_references
+                    return f"\n\n해당 질문에 대한 내용은 이미지 파일로 확인해주세요.\n 자세한 사항은 공지사항을 살펴봐주세요.\n\n{url}"
+                else:
+                    url = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
+                return f"\n\n해당 질문은 공지사항에 없는 내용입니다.\n 자세한 사항은 공지사항을 살펴봐주세요.\n\n{url}"
+            if top_docs[0][0] < 1.8:
+                url = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
+                return f"\n\n해당 질문은 공지사항에 없는 내용입니다.\n 자세한 사항은 공지사항을 살펴봐주세요.\n\n{url}"
+            start = time.time()
+            existing_answer = qa_chain.invoke(
+                question
+            )  # 초기 답변 생성 및 문자열로 할당
+            answer_time = time.time() - start
+            print(f"답변 생성 시간 : {answer_time}")
+
+            answer_result = existing_answer
+            big_end = time.time()
+            print(f"총 시간 : {big_end-big_start}")
+            display(HTML(image_display))
+            # 상위 3개의 참조한 문서의 URL 포함 형식으로 반환
+            doc_references = "\n".join(
+                [
+                    f"\n참고 문서 URL: {doc.metadata['url']}"
+                    for doc in relevant_docs[:1]
+                    if doc.metadata.get("url") != "No URL"
+                ]
+            )
+            # AI의 최종 답변과 참조 URL을 함께 반환
+            return f"{answer_result}\n\n------------------------------------------------\n항상 정확한 답변을 제공하지 못할 수 있습니다.\n아래의 URL들을 참고하여 정확하고 자세한 정보를 확인하세요.\n{doc_references}"
 
     def run(self, user_question):
         self.initialize_bm25_titles()
-        self.best_docs(user_question)
+        ret = self.get_ai_message(user_question)
+        print(ret)

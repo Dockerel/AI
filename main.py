@@ -14,16 +14,18 @@ pinecone_index_name = os.environ.get("PINECONE_INDEX_NAME")
 pc = Pinecone(api_key=pinecone_api_key)
 index = pc.Index(pinecone_index_name)
 
+# gpu 사용하는 경우
 # # device = "cuda"
 # # model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
 
+# cpu 사용하는 경우
 device = "cpu"
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# # embedding pipeline
+# embedding pipeline
 # # embedding_pipeline = WebEmbeddingPipeline(index, model)
 # # embedding_pipeline.run()
 
 # query processing pipeline
-query_pipeline = QueryProcessingPipeline(index, model)
+query_pipeline = QueryProcessingPipeline(upstage_api_key, index, model)
 query_pipeline.run("글솝인데 졸업 요건을 알고 싶어")
