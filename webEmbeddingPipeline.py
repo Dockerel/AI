@@ -15,3 +15,4 @@ class WebEmbeddingPipeline:
     def run(self):
         self.crawler.run()
         self.embedding.run()
+        self.preprosessor.saveResults()

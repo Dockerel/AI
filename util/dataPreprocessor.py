@@ -1,3 +1,4 @@
+import json
 from util.characterTextSplitter import CharacterTextSplitter
 
 
@@ -151,3 +152,15 @@ class DataPreprocessor:
                 self.image_url.append(
                     image if image else "No content"
                 )  # 이미지 URL 추가
+
+    def saveResults(self):
+        with open("data/texts.json", "w") as file:
+            json.dump(self.texts, file)
+        with open("data/image_url.json", "w") as file:
+            json.dump(self.image_url, file)
+        with open("data/titles.json", "w") as file:
+            json.dump(self.titles, file)
+        with open("data/doc_urls.json", "w") as file:
+            json.dump(self.doc_urls, file)
+        with open("data/doc_dates.json", "w") as file:
+            json.dump(self.doc_dates, file)
