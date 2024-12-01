@@ -1277,7 +1277,7 @@ class QueryProcessingPipeline:
 
         else:
             start = time.time()
-            qa_chain, retriever, relevant_docs = self.get_answer_from_chain(
+            qa_chain, relevant_docs = self.get_answer_from_chain(
                 top_docs, question
             )  # 답변 생성 체인 생성
             chain_time = time.time() - start
